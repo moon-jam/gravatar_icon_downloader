@@ -1,0 +1,129 @@
+#!/bin/bash
+
+# --- Help Message Function ---
+show_help() {
+  echo "Usage: ./download --file=<INPUT_FILE> [--size=<SIZE>] [--default=<URL_OR_PATH>]"
+  echo ""
+  echo "Downloads Gravatar icons based on a name/email list."
+  echo ""
+  echo "Arguments:"
+  echo "  --file=<PATH>     Required. Path to the input file. Each line should contain a name and an email, separated by a Tab."
+  echo "  --size=<PIXELS>   Optional. The desired width/height of the avatar. Defaults to 200."
+  echo "  --default=<URL_OR_PATH> Optional. A URL to a default image or a path to a local image file if a Gravatar is not found."
+  echo "                    If this is used, the local default.png fallback is disabled."
+  echo "  -h, --help        Show this help message."
+}
+
+# --- Default Values ---
+INPUT_FILE=""
+SIZE=200
+DEFAULT_URL_OR_PATH=""
+DEFAULT_TYPE="none" # Can be "none", "url", or "path"
+
+# --- Argument Parsing ---
+while [[ "$#" -gt 0 ]]; do
+    case $1 in
+        --file=*) INPUT_FILE="${1#*=}";;
+        --size=*) SIZE="${1#*=}";;
+        --default=*)
+            DEFAULT_URL_OR_PATH="${1#*=}"
+            if [[ "$DEFAULT_URL_OR_PATH" =~ ^https?:// ]]; then
+                DEFAULT_TYPE="url"
+            else
+                DEFAULT_TYPE="path"
+            fi
+            ;;
+        -h|--help) show_help; exit 0;;
+        *) echo "Unknown parameter passed: $1"; show_help; exit 1;;
+    esac
+    shift
+done
+
+# --- Validation ---
+if [ -z "$INPUT_FILE" ]; then
+  echo "Error: Input file not specified."
+  show_help
+  exit 1
+fi
+
+if [ ! -f "$INPUT_FILE" ]; then
+    echo "Error: Input file '$INPUT_FILE' not found."
+    exit 1
+fi
+
+# --- Script Start ---
+TEMP_DEFAULT="/tmp/gravatar_default_$$.png"
+trap 'rm -f "$TEMP_DEFAULT"' EXIT # Cleanup temp file on script exit
+
+mkdir -p output
+
+# If the user is NOT using a custom remote default, we need to check for the standard Gravatar default.
+if [ -z "$DEFAULT_URL_OR_PATH" ]; then
+  echo "Fetching current Gravatar default image for comparison..."
+  # Use a bogus hash to reliably get the default image.
+  curl -L -s -o "$TEMP_DEFAULT" "https://www.gravatar.com/avatar/00000000000000000000000000000000?s=${SIZE}&d=robohash"
+  DEFAULT_GRAVATAR_HASH=$(md5 -q "$TEMP_DEFAULT")
+fi
+
+echo "Downloading avatars with size ${SIZE}x${SIZE}px from '$INPUT_FILE'..."
+
+while IFS=$'\t' read -r name email; do
+  email=$(echo "$email" | awk '{$1=$1};1')
+  name=$(echo "$name" | awk '{$1=$1};1')
+
+  if [ -z "$name" ] || [ -z "$email" ]; then
+    continue
+  fi
+
+  email_lower=$(echo "$email" | tr '[:upper:]' '[:lower:]')
+  hash=$(echo -n "$email_lower" | md5)
+  
+  sanitized_name=$(echo "$name" | sed 's/\//-/g')
+  output_file="output/${sanitized_name}.png"
+
+  # Construct Gravatar URL
+  gravatar_url="https://www.gravatar.com/avatar/${hash}?s=${SIZE}"
+
+  if [ "$DEFAULT_TYPE" == "url" ]; then
+    encoded_DEFAULT_URL_OR_PATH=$(python -c "import urllib.parse; print(urllib.parse.quote(\"$DEFAULT_URL_OR_PATH\"))")
+    gravatar_url+="&d=${encoded_DEFAULT_URL_OR_PATH}"
+  else
+    # Use a standard default (mystery person) to ensure we always get an image for checksum comparison.
+    gravatar_url+="&d=mp"
+  fi
+
+  echo "Processing: ${name} <${email}>"
+  curl -L -s -o "$output_file" "$gravatar_url"
+
+  # Handle post-download logic based on DEFAULT_TYPE
+  if [ "$DEFAULT_TYPE" == "url" ]; then
+    # If using a remote default URL, Gravatar handles it, so our job is done.
+    echo "  -> Avatar saved to ${output_file}"
+  else
+    # Otherwise (DEFAULT_TYPE is 'none' or 'path'), check if the downloaded image is the standard Gravatar default.
+    downloaded_hash=$(md5 -q "$output_file")
+    if [ "$downloaded_hash" == "$DEFAULT_GRAVATAR_HASH" ]; then
+      if [ "$DEFAULT_TYPE" == "path" ]; then
+        # If --default was a local path, use that as the fallback.
+        if [ -f "$DEFAULT_URL_OR_PATH" ]; then
+          echo "  -> No custom Gravatar found. Using specified default path: ${DEFAULT_URL_OR_PATH}"
+          cp "$DEFAULT_URL_OR_PATH" "$output_file"
+        else
+          echo "  -> No custom Gravatar found, and specified default path not found. Keeping Gravatar default."
+        fi
+      else # DEFAULT_TYPE is 'none'
+        # Fallback to local default.png if it exists.
+        if [ -f "default.png" ]; then
+            echo "  -> No custom Gravatar found. Using local default.png."
+            cp "default.png" "$output_file"
+        else
+            echo "  -> No custom Gravatar found and no local default.png exists. Keeping Gravatar default."
+        fi
+      fi
+    else
+      echo "  -> Custom avatar saved to ${output_file}"
+    fi
+  fi
+done < "$INPUT_FILE"
+
+echo "Done."
